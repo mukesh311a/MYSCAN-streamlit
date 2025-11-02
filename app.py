@@ -14,7 +14,7 @@ def get_setting(key, default=None):
 def fix_db_url(url: str) -> str:
     if not url:
         return url
-    # Normalize to SQLAlchemy + psycopg3
+    # Normalize to SQLAlchemy + psycopg3 driver
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     if url.startswith("postgresql+psycopg://"):
@@ -38,6 +38,7 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 
 def ensure_schema():
     with engine.begin() as conn:
+        # main cars table
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS cars (
           id UUID PRIMARY KEY,
@@ -52,16 +53,39 @@ def ensure_schema():
           doc_password_hash TEXT,
           owner_secret UUID NOT NULL,
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          owner_user_id UUID,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );"""))
+        # add any missing columns on existing installs
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS dl_url2 TEXT;"))
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS puc_url TEXT;"))
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS owner_secret UUID;"))
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;"))
+        conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS owner_user_id UUID;"))
         conn.execute(text("UPDATE cars SET is_active=TRUE WHERE is_active IS NULL;"))
-        rows = conn.execute(text("SELECT id FROM cars WHERE owner_secret IS NULL LIMIT 1")).fetchall()
-        for _ in rows:
-            conn.execute(text("UPDATE cars SET owner_secret=:s WHERE owner_secret IS NULL"), {"s": str(uuid.uuid4())})
+
+        # users (for User Dashboard)
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS users (
+          id UUID PRIMARY KEY,
+          email TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );"""))
+
+        # uploaded docs (optional, per car + kind)
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS docs (
+          id UUID PRIMARY KEY,
+          car_id UUID NOT NULL REFERENCES cars(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('rc','dl1','dl2','puc')),
+          filename TEXT,
+          mime TEXT,
+          content BYTEA,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );"""))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS docs_car_kind_idx ON docs(car_id, kind);"))
+
 ensure_schema()
 
 # ===========
@@ -91,7 +115,7 @@ def owner_url_for_car(car_id: str, secret: str) -> str:
     return f"{base}?"+ urlencode({"page": "owner", "owner": car_id, "secret": secret}) if base else f"?page=owner&owner={car_id}&secret={secret}"
 
 # ===========
-# Data access
+# Data access: cars
 # ===========
 def create_car(owner_name, car_no, owner_phone, virtual_number, rc, dl1, dl2, puc, doc_pw):
     with engine.begin() as conn:
@@ -132,7 +156,63 @@ def update_owner(car_id, rc, dl1, dl2, puc, new_pw):
         conn.execute(text(f"UPDATE cars SET {', '.join(sets)} WHERE id=:id"), params)
 
 # ===========
-# UI theme & helpers
+# Data access: users & ownership
+# ===========
+def create_user(email: str, password: str):
+    with engine.begin() as conn:
+        uid = str(uuid.uuid4())
+        ph = bcrypt.hashpw(password.strip().encode(), bcrypt.gensalt()).decode()
+        conn.execute(text("""
+          INSERT INTO users (id, email, password_hash) VALUES (:id,:e,:p)
+        """), dict(id=uid, e=email.strip().lower(), p=ph))
+        return uid
+
+def auth_user(email: str, password: str):
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT id, password_hash FROM users WHERE email=:e"),
+                           dict(e=email.strip().lower())).mappings().first()
+        if not row: return None
+        return row["id"] if bcrypt.checkpw(password.strip().encode(), row["password_hash"].encode()) else None
+
+def claim_car_for_user(car_id: str, owner_secret: str, user_id: str) -> bool:
+    with engine.begin() as conn:
+        car = conn.execute(text("SELECT id, owner_secret FROM cars WHERE id=:id"), dict(id=car_id)).mappings().first()
+        if not car or str(car["owner_secret"]) != str(owner_secret):
+            return False
+        conn.execute(text("UPDATE cars SET owner_user_id=:u WHERE id=:id"), dict(u=user_id, id=car_id))
+        return True
+
+def list_user_cars(user_id: str):
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+          SELECT * FROM cars WHERE owner_user_id=:u ORDER BY created_at DESC
+        """), dict(u=user_id)).mappings().all()
+        return [dict(r) for r in rows]
+
+# ===========
+# Data access: uploaded docs
+# ===========
+def get_docs_for_car(car_id: str):
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT * FROM docs WHERE car_id=:c"), dict(c=car_id)).mappings().all()
+        out = {}
+        for r in rows:
+            out[r["kind"]] = dict(r)
+        return out
+
+def upsert_doc(car_id: str, kind: str, filename: str, mime: str, data: bytes):
+    with engine.begin() as conn:
+        doc_id = str(uuid.uuid4())
+        conn.execute(text("""
+          INSERT INTO docs (id, car_id, kind, filename, mime, content)
+          VALUES (:id,:c,:k,:f,:m,:d)
+          ON CONFLICT (car_id, kind) DO UPDATE
+          SET filename=excluded.filename, mime=excluded.mime, content=excluded.content, created_at=now()
+        """), dict(id=doc_id, c=car_id, k=kind, f=filename, m=mime, d=data))
+        return doc_id
+
+# ===========
+# UI theme (white + dark-blue + light-orange)
 # ===========
 st.set_page_config(page_title="MYSCAN", page_icon="🚗", layout="centered")
 
@@ -141,77 +221,71 @@ st.markdown("""
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 html, body, [data-testid="stAppViewContainer"] * { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-[data-testid="stAppViewContainer"] {
-  background:
-    radial-gradient(1300px 700px at 10% -10%, #122143 0%, transparent 60%),
-    radial-gradient(1000px 600px at 90% 10%, #1b2b49 0%, transparent 55%),
-    linear-gradient(180deg,#0a0f1a,#0e1426);
-}
+[data-testid="stAppViewContainer"] { background: #ffffff; }
 .topbar {
   position: sticky; top: 0; z-index: 1000;
-  background: rgba(9,12,20,.75); backdrop-filter: blur(10px);
-  border-bottom: 1px solid #1e293b;
+  background: rgba(255,255,255,.9); backdrop-filter: blur(8px);
+  border-bottom: 1px solid #e6eef6;
   margin-bottom: 18px; padding: 10px 14px; border-radius: 0 0 16px 16px;
 }
-.topbar .brand { font-weight: 800; letter-spacing: .2px; font-size: 18px; color: #e2e8f0 }
-.topbar .muted { color: #8aa0b7; font-weight: 600; }
-.topbar a { color: #8dd1ff; text-decoration: none; margin-left: 14px; }
+.topbar .brand { font-weight: 800; letter-spacing: .2px; font-size: 18px; color: #0b1b3a }
+.topbar .muted { color: #4a6786; font-weight: 600; }
+.topbar a { color: #1d4ed8; text-decoration: none; margin-left: 14px; }
 .card {
-  background: linear-gradient(180deg, rgba(15,23,42,.92), rgba(15,23,42,.86));
-  border:1px solid #1e293b; border-radius: 20px;
-  padding: 22px; box-shadow: 0 20px 48px rgba(0,0,0,.45);
+  background: #ffffff;
+  border:1px solid #e6eef6; border-radius: 16px;
+  padding: 22px; box-shadow: 0 12px 30px rgba(12, 35, 64, .06);
+  color: #0b1b3a;
 }
-.hero {
-  position: relative; overflow: hidden;
-  background:
-    radial-gradient(650px 240px at 15% 0%, rgba(94,234,212,.12), transparent 65%),
-    radial-gradient(650px 240px at 85% 10%, rgba(192,132,252,.12), transparent 70%);
-}
-.h1 { font-size: 30px; margin: 0 0 8px; color: #ecf2f8; }
-.subtle { color: #9fb0c3; margin: 0; }
+.hero { background: linear-gradient(180deg, #ffffff, #f8fbff); }
+.h1 { font-size: 28px; margin: 0 0 8px; color: #0b1b3a; }
+.subtle { color: #4a6786; margin: 0; }
 .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 820px){ .grid2 { grid-template-columns:1fr; } }
-.chip {
-  display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #283548; color:#9fb0c3; font-size:12px;
-}
+.chip { display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #e6eef6; color:#4a6786; font-size:12px; background:#f3f8ff; }
 .kv { display:grid; grid-template-columns: 160px 1fr; gap:10px; margin-top: 8px; }
-.kv div { padding: 10px 0; border-bottom: 1px solid #1e293b; }
-.note { color:#9fb0c3; font-size: 13px; }
-.sep { border:0; border-top:1px solid #1e293b; margin:18px 0; }
+.kv div { padding: 10px 0; border-bottom: 1px solid #e6eef6; }
+.note { color:#4a6786; font-size: 13px; }
+.sep { border:0; border-top:1px solid #e6eef6; margin:18px 0; }
 
+/* Inputs */
 .stTextInput>div>div>input, .stTextInput>label, .stTextArea textarea {
-  background: #0d1420 !important; color: #ecf2f8 !important;
+  background: #ffffff !important; color: #0b1b3a !important; border:1px solid #e6eef6 !important; border-radius: 10px !important;
 }
+
+/* Buttons: light orange primary, blue secondary, subtle ghost */
 .stButton>button, .stLinkButton>button {
-  border-radius: 14px !important; padding: 12px 18px !important; font-weight: 700 !important;
-  border: 0 !important; color: #041217 !important;
-  background: linear-gradient(180deg,#5eead4,#22d3ee) !important;
-  box-shadow: 0 12px 30px rgba(34,211,238,.28) !important;
+  border-radius: 12px !important; padding: 12px 18px !important; font-weight: 700 !important;
+  border: 1px solid #ffd7b3 !important; color: #5b2400 !important;
+  background: linear-gradient(180deg,#ffe6cc,#ffcc99) !important; /* light orange */
+  box-shadow: 0 8px 20px rgba(255, 153, 51, .25) !important;
 }
-.stButton>button:hover, .stLinkButton>button:hover { filter: brightness(1.06); }
+.stButton>button:hover, .stLinkButton>button:hover { filter: brightness(1.03); }
 .btn-secondary button {
-  background: linear-gradient(180deg,#c084fc,#a855f7) !important; color: #160728 !important;
-  box-shadow: 0 12px 30px rgba(168,85,247,.28) !important;
+  background: linear-gradient(180deg,#e6f0ff,#cfe0ff) !important; color: #0b1b3a !important; border:1px solid #c7d7f7 !important;
+  box-shadow: 0 8px 20px rgba(29, 78, 216, .12) !important;
 }
 .btn-ghost button {
-  background: transparent !important; color: #9fb0c3 !important; border: 1px solid #283548 !important; box-shadow:none !important;
+  background: #ffffff !important; color: #4a6786 !important; border: 1px solid #e6eef6 !important; box-shadow:none !important;
 }
 .btn-warn button {
-  background: linear-gradient(180deg,#fca5a5,#f97316) !important; color: #2b1105 !important;
-  box-shadow: 0 12px 30px rgba(249,115,22,.28) !important;
+  background: linear-gradient(180deg,#ffe5e5,#ffd0b3) !important; color: #5b2400 !important; border:1px solid #ffc2a3 !important;
 }
-.qr-preview { border:1px dashed #2b3a52; border-radius:16px; padding:10px; background:#0b1220; }
+
+/* small bits */
+.qr-preview { border:1px dashed #dbe7f3; border-radius:12px; padding:10px; background:#fbfdff; }
 .help ul { margin: 0 0 0 18px; }
 </style>
 """, unsafe_allow_html=True)
 
 # sticky topbar
 st.markdown(
-    f"""
+    """
 <div class="topbar">
   <span class="brand">MYSCAN</span>
   <span class="muted">· Smart vehicle QR</span>
   <span style="float:right">
+    <a href="?page=user">User dashboard</a>
     <a href="?page=admin">Admin</a>
     <a href="?">Home</a>
   </span>
@@ -329,18 +403,10 @@ if page == "admin":
             with box[3]:
                 a, b, cbtn = st.columns(3)
                 if r['is_active']:
-                    with a: st.button("Deactivate", key=f"deact-{r['id']}", help="Make public page unavailable")
-                    if st.session_state.get(f"deact-{r['id']}", False): pass
-                    if a.button(" ", key=f"deact_submit_{r['id']}", help="hidden"): pass
-                    if a.button: pass
-                    if a: pass
-                    if a and a: pass
-                # simple explicit buttons (no tricks)
-                if r['is_active']:
-                    if a.button("Deactivate", key=f"btn-deact-{r['id']}", help="Make public page unavailable"):
+                    if a.button("Deactivate", key=f"btn-deact-{r['id']}"):
                         set_active(r['id'], False); st.rerun()
                 else:
-                    if a.button("Reactivate", key=f"btn-react-{r['id']}", help="Make public page available"):
+                    if a.button("Reactivate", key=f"btn-react-{r['id']}"):
                         set_active(r['id'], True); st.rerun()
                 if b.button("Regenerate QRs", key=f"regen-{r['id']}"):
                     car = get_car(r['id'])
@@ -357,7 +423,106 @@ if page == "admin":
     st.stop()
 
 # ===========
-# Owner panel
+# User dashboard (NEW)
+# ===========
+if page == "user":
+    # Auth UI
+    c = section_card("User dashboard", "Sign in to manage your vehicle documents", hero=True)
+    with c:
+        tab_login, tab_signup = st.tabs(["Sign in", "Create account"])
+        with tab_login:
+            le = st.text_input("Email")
+            lp = st.text_input("Password", type="password")
+            if st.button("Sign in", key="user_signin"):
+                uid = auth_user(le or "", lp or "")
+                if uid:
+                    st.session_state["user_id"] = uid
+                    st.success("Signed in")
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password")
+        with tab_signup:
+            se = st.text_input("Email (for new account)")
+            sp1 = st.text_input("Password", type="password")
+            sp2 = st.text_input("Confirm password", type="password")
+            if st.button("Create account", key="user_signup"):
+                if not se or not sp1 or sp1 != sp2:
+                    st.error("Enter email and matching passwords")
+                else:
+                    try:
+                        uid = create_user(se, sp1)
+                        st.session_state["user_id"] = uid
+                        st.success("Account created")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("Could not create account (maybe email already used)")
+    end_card()
+
+    # If not signed in, stop
+    if not st.session_state.get("user_id"):
+        st.stop()
+
+    # Signed in view
+    uid = st.session_state["user_id"]
+    c2 = section_card("Link your car", "Use Owner Secret (from Admin) to claim your car and manage docs")
+    with c2:
+        ccid = st.text_input("Car ID")
+        csec = st.text_input("Owner Secret")
+        if st.button("Claim this car"):
+            if claim_car_for_user(ccid or "", csec or "", uid):
+                st.success("Car linked to your account"); st.rerun()
+            else:
+                st.error("Invalid Car ID or Owner Secret")
+    end_card()
+
+    c3 = section_card("My vehicles", "Update password, links, and upload documents")
+    with c3:
+        mycars = list_user_cars(uid)
+        if not mycars:
+            st.caption("No cars linked yet.")
+        for car in mycars:
+            st.markdown(f"### {car['owner_name']} · {car['car_no']}  "
+                        f"{'🟢 Active' if car['is_active'] else '🔴 Inactive'}")
+            with st.form(f"edit-{car['id']}"):
+                new_pw = st.text_input("Docs password (leave blank to keep)", type="password")
+                rc = st.text_input("RC link", value=car.get("rc_url") or "", placeholder="https://...")
+                dl1= st.text_input("DL (front) link", value=car.get("dl_url") or "", placeholder="https://...")
+                dl2= st.text_input("DL (back) link", value=car.get("dl_url2") or "", placeholder="https://...")
+                puc= st.text_input("Pollution (PUC) link", value=car.get("puc_url") or "", placeholder="https://...")
+
+                st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
+                st.caption("Optional uploads (small PDFs/images). If provided, they’ll show as downloadable files after password unlock on the public page.")
+                up_rc  = st.file_uploader("Upload RC file", type=["pdf","png","jpg","jpeg"], key=f"rc-{car['id']}")
+                up_dl1 = st.file_uploader("Upload DL (front)", type=["pdf","png","jpg","jpeg"], key=f"dl1-{car['id']}")
+                up_dl2 = st.file_uploader("Upload DL (back)", type=["pdf","png","jpg","jpeg"], key=f"dl2-{car['id']}")
+                up_puc = st.file_uploader("Upload PUC", type=["pdf","png","jpg","jpeg"], key=f"puc-{car['id']}")
+
+                col = st.columns(3)
+                save = col[0].form_submit_button("Save changes")
+                if car["is_active"]:
+                    deact = col[1].form_submit_button("Deactivate QR")
+                    react = None
+                else:
+                    react = col[1].form_submit_button("Reactivate QR")
+                    deact = None
+
+            if save:
+                update_owner(car["id"], rc, dl1, dl2, puc, new_pw)
+                # handle uploads
+                for blob, kind in [(up_rc,"rc"),(up_dl1,"dl1"),(up_dl2,"dl2"),(up_puc,"puc")]:
+                    if blob is not None:
+                        upsert_doc(car["id"], kind, blob.name, blob.type or "application/octet-stream", blob.getvalue())
+                st.success("Saved")
+                st.rerun()
+            if deact:
+                set_active(car["id"], False); st.success("QR deactivated"); st.rerun()
+            if react:
+                set_active(car["id"], True); st.success("QR reactivated"); st.rerun()
+    end_card()
+    st.stop()
+
+# ===========
+# Owner panel (legacy secret link)
 # ===========
 if page == "owner":
     if not owner_id or not secret:
@@ -373,7 +538,7 @@ if page == "owner":
             st.markdown("**Password**")
             new_pw = st.text_input("Set/Change password (leave blank to keep)", type="password", placeholder="Enter a new password")
             st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
-            st.markdown("**Documents**")
+            st.markdown("**Documents (links)**")
             rc = st.text_input("RC link", value=car.get("rc_url") or "", placeholder="https://...")
             dl1= st.text_input("DL (front)", value=car.get("dl_url") or "", placeholder="https://...")
             dl2= st.text_input("DL (back)", value=car.get("dl_url2") or "", placeholder="https://...")
@@ -420,36 +585,48 @@ if page == "public":
             if not hash_:
                 st.error("Owner has not set a password yet.")
             elif bcrypt.checkpw((pw or "").strip().encode(), hash_.encode()):
-                g = st.columns(2)
-                with g[0]:
-                    if car.get("rc_url"):  st.link_button("Show RC", car["rc_url"], use_container_width=True)
-                    if car.get("dl_url"):  st.link_button("Show DL (front)", car["dl_url"], use_container_width=True)
-                with g[1]:
-                    if car.get("dl_url2"): st.link_button("Show DL (back)", car["dl_url2"], use_container_width=True)
-                    if car.get("puc_url"): st.link_button("Show Pollution", car["puc_url"], use_container_width=True)
+                # links
+                g1 = st.columns(2)
+                with g1[0]:
+                    if car.get("rc_url"):  st.link_button("Open RC link", car["rc_url"], use_container_width=True)
+                    if car.get("dl_url"):  st.link_button("Open DL (front) link", car["dl_url"], use_container_width=True)
+                with g1[1]:
+                    if car.get("dl_url2"): st.link_button("Open DL (back) link", car["dl_url2"], use_container_width=True)
+                    if car.get("puc_url"): st.link_button("Open PUC link", car["puc_url"], use_container_width=True)
+
+                # uploaded files (if any)
+                docs = get_docs_for_car(car_id)
+                if docs:
+                    st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
+                    st.subheader("Downloads (uploaded)")
+                    dcols = st.columns(2)
+                    order = [("rc","RC"),("dl1","DL (front)"),("dl2","DL (back)"),("puc","PUC")]
+                    i = 0
+                    for k,label in order:
+                        if k in docs and docs[k].get("content"):
+                            data = bytes(docs[k]["content"])
+                            name = docs[k].get("filename") or f"{k}.bin"
+                            with dcols[i%2]:
+                                st.download_button(f"Download {label}", data, file_name=name,
+                                                   mime=docs[k].get("mime") or "application/octet-stream", use_container_width=True)
+                            i += 1
             else:
                 st.error("Wrong password")
-        st.caption(["Believe you can and you’re halfway there.",
-                    "Small steps every day.",
-                    "Stay curious, stay kind.",
-                    "Do the next right thing.",
-                    "Progress, not perfection.",
-                    "Make it simple, make it better."][int(time.time()) % 6])
+        st.caption(["Keep it moving.", "Small steps every day.", "Progress, not perfection."][int(time.time()) % 3])
     end_card()
     st.stop()
 
 # ===========
 # Home
 # ===========
-c = section_card("MYSCAN", "Add ?page=admin to manage, or use a QR to open a public car page.", hero=True)
+c = section_card("MYSCAN", "User dashboard for owners, Admin for creation, Public via QR.", hero=True)
 with c:
     st.markdown("""
 <div class="help">
   <ul>
-    <li><a href="?page=admin">Admin dashboard</a></li>
-    <li><code>?page=public&c=&lt;car_id&gt;</code></li>
-    <li><code>?page=owner&owner=&lt;car_id&gt;&secret=&lt;owner_secret&gt;</code></li>
-  </ul>
+    <li><a href="?page=user">User dashboard</a> — sign in, claim car, update links, upload docs</li>
+    <li><a href="?page=admin">Admin</a> — create car entries & generate QRs</li>
+    <li><code>?page=public&c=&lt;car_id&gt;</code> — public view from QR</li>
 </div>
 """, unsafe_allow_html=True)
 end_card()
