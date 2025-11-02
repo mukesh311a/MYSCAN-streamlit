@@ -2,10 +2,11 @@ import os, io, uuid, time, re
 import streamlit as st
 from urllib.parse import urlencode
 from sqlalchemy import create_engine, text
-import qrcode, bcrypt
+import qrcode
+from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image
 
-# =============== Settings & DB URL helper ===============
+# ---------------------- Settings & DB URL helper ----------------------
 def get_setting(key, default=None):
     return st.secrets.get(key, os.getenv(key, default))
 
@@ -29,8 +30,13 @@ if not DB_URL:
     st.error("DATABASE_URL is not set. Add it in Streamlit → App settings → Secrets.")
     st.stop()
 
-# ================== DB ==================
-engine = create_engine(DB_URL, pool_pre_ping=True)
+# ---------------------- DB ----------------------
+try:
+    engine = create_engine(DB_URL, pool_pre_ping=True)
+except Exception as e:
+    st.error("Failed to connect to the database. Check DATABASE_URL in Secrets.")
+    st.exception(e)
+    st.stop()
 
 def ensure_schema():
     with engine.begin() as conn:
@@ -77,10 +83,9 @@ def ensure_schema():
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );"""))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS docs_car_kind_idx ON docs(car_id, kind);"))
-
 ensure_schema()
 
-# ================== Utils ==================
+# ---------------------- Utils ----------------------
 PHONE_RE = re.compile(r"(\+?\d{7,15})")
 def sanitize_phone(s: str) -> str:
     if not s: return ""
@@ -104,12 +109,24 @@ def owner_url_for_car(car_id: str, secret: str) -> str:
     base = PUBLIC_BASE or ""
     return f"{base}?"+ urlencode({"page": "owner", "owner": car_id, "secret": secret}) if base else f"?page=owner&owner={car_id}&secret={secret}"
 
-# ------------- Cars -------------
+# Query params helper that works across Streamlit versions
+def get_qp(name: str, default: str | None = None):
+    try:
+        # New API (1.30+)
+        v = st.query_params.get(name)
+        return v if isinstance(v, str) else (v[0] if isinstance(v, list) and v else default)
+    except Exception:
+        # Old experimental API
+        qp = st.experimental_get_query_params()
+        v = qp.get(name)
+        return v[0] if isinstance(v, list) and v else default
+
+# ---------------------- Data access: cars ----------------------
 def create_car(owner_name, car_no, owner_phone, virtual_number, rc, dl1, dl2, puc, doc_pw):
     with engine.begin() as conn:
         car_id = str(uuid.uuid4())
         owner_secret = str(uuid.uuid4())
-        pw_hash = bcrypt.hashpw(doc_pw.encode(), bcrypt.gensalt()).decode() if (doc_pw or "").strip() else None
+        pw_hash = generate_password_hash(doc_pw.strip()) if (doc_pw or "").strip() else None
         conn.execute(text("""
           INSERT INTO cars (id, owner_name, car_no, owner_phone, virtual_number,
                             rc_url, dl_url, dl_url2, puc_url, doc_password_hash, owner_secret, is_active)
@@ -139,15 +156,15 @@ def update_owner(car_id, rc, dl1, dl2, puc, new_pw):
     params = dict(id=car_id, rc=(rc or None), dl1=(dl1 or None), dl2=(dl2 or None), puc=(puc or None))
     if (new_pw or "").strip():
         sets.append("doc_password_hash=:hash")
-        params["hash"] = bcrypt.hashpw(new_pw.strip().encode(), bcrypt.gensalt()).decode()
+        params["hash"] = generate_password_hash(new_pw.strip())
     with engine.begin() as conn:
         conn.execute(text(f"UPDATE cars SET {', '.join(sets)} WHERE id=:id"), params)
 
-# ------------- Users & Ownership -------------
+# ---------------------- Data access: users & ownership ----------------------
 def create_user(email: str, password: str):
     with engine.begin() as conn:
         uid = str(uuid.uuid4())
-        ph = bcrypt.hashpw(password.strip().encode(), bcrypt.gensalt()).decode()
+        ph = generate_password_hash(password.strip())
         conn.execute(text("INSERT INTO users (id, email, password_hash) VALUES (:id,:e,:p)"),
                      dict(id=uid, e=email.strip().lower(), p=ph))
         return uid
@@ -157,7 +174,7 @@ def auth_user(email: str, password: str):
         row = conn.execute(text("SELECT id, password_hash FROM users WHERE email=:e"),
                            dict(e=email.strip().lower())).mappings().first()
         if not row: return None
-        return row["id"] if bcrypt.checkpw(password.strip().encode(), row["password_hash"].encode()) else None
+        return row["id"] if check_password_hash(row["password_hash"], password.strip()) else None
 
 def claim_car_for_user(car_id: str, owner_secret: str, user_id: str) -> bool:
     with engine.begin() as conn:
@@ -173,14 +190,11 @@ def list_user_cars(user_id: str):
                             dict(u=user_id)).mappings().all()
         return [dict(r) for r in rows]
 
-# ------------- Uploads -------------
+# ---------------------- Uploads ----------------------
 def get_docs_for_car(car_id: str):
     with engine.begin() as conn:
         rows = conn.execute(text("SELECT * FROM docs WHERE car_id=:c"), dict(c=car_id)).mappings().all()
-        out = {}
-        for r in rows:
-            out[r["kind"]] = dict(r)
-        return out
+        out = {};  [out.setdefault(r["kind"], dict(r)) for r in rows];  return out
 
 def upsert_doc(car_id: str, kind: str, filename: str, mime: str, data: bytes):
     with engine.begin() as conn:
@@ -193,7 +207,7 @@ def upsert_doc(car_id: str, kind: str, filename: str, mime: str, data: bytes):
         """), dict(id=doc_id, c=car_id, k=kind, f=filename, m=mime, d=data))
         return doc_id
 
-# ================== UI THEME (WHITE/BLUE + ORANGE) ==================
+# ---------------------- THEME (white/blue + light orange) ----------------------
 st.set_page_config(page_title="MYSCAN", page_icon="🚗", layout="centered")
 st.markdown("""
 <style>
@@ -229,7 +243,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# sticky topbar
+# Topbar
 st.markdown("""
 <div class="topbar">
   <span class="brand">MYSCAN</span>
@@ -250,21 +264,20 @@ def section_card(title: str, subtitle: str = "", hero=False):
 def end_card():
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ================== Router ==================
-qs = st.query_params
-page = qs.get("page") or ""
-car_id = qs.get("c")
-owner_id = qs.get("owner")
-secret = qs.get("secret")
+# ---------------------- Router ----------------------
+page   = get_qp("page", "")
+car_id = get_qp("c")
+owner_id = get_qp("owner")
+secret  = get_qp("secret")
 
-# ================== Admin ==================
+# ---------------------- Admin ----------------------
 if page == "admin":
     c = section_card("Admin dashboard", "Create & manage vehicle QRs", hero=True)
     with c:
         cols = st.columns([2,1])
         with cols[0]:
             pwd = st.text_input("Admin password", type="password", placeholder="Enter admin password", key="admin_pwd")
-            if st.button("Sign in", key="signin_btn"):
+            if st.button("Sign in"):
                 if (pwd or "").strip() == ADMIN_PASSWORD:
                     st.session_state["admin_ok"] = True
                 else:
@@ -335,7 +348,7 @@ if page == "admin":
             with b:
                 st.markdown(f"<span class='chip'>{'Active' if r['is_active'] else 'Inactive'}</span>", unsafe_allow_html=True)
             with c:
-                st.link_button("Open public", pub_link, key=f"openpub_{r['id']}")
+                st.link_button("Open public", pub_link)
             with d:
                 if r['is_active']:
                     if st.button("Deactivate", key=f"btn_deact_{r['id']}"):
@@ -356,7 +369,7 @@ if page == "admin":
     end_card()
     st.stop()
 
-# ================== User dashboard ==================
+# ---------------------- User dashboard ----------------------
 if page == "user":
     c = section_card("User dashboard", "Sign in to manage your vehicle documents", hero=True)
     with c:
@@ -364,49 +377,40 @@ if page == "user":
         with tab_login:
             le = st.text_input("Email", key="login_email")
             lp = st.text_input("Password", type="password", key="login_password")
-            if st.button("Sign in", key="user_signin"):
+            if st.button("Sign in"):
                 uid = auth_user(le or "", lp or "")
-                if uid:
-                    st.session_state["user_id"] = uid
-                    st.success("Signed in"); st.rerun()
-                else:
-                    st.error("Invalid email or password")
+                if uid: st.session_state["user_id"] = uid; st.success("Signed in"); st.rerun()
+                else: st.error("Invalid email or password")
         with tab_signup:
             se  = st.text_input("Email (for new account)", key="signup_email")
             sp1 = st.text_input("Password", type="password", key="signup_password")
             sp2 = st.text_input("Confirm password", type="password", key="signup_confirm")
-            if st.button("Create account", key="user_signup"):
+            if st.button("Create account"):
                 if not se or not sp1 or sp1 != sp2:
                     st.error("Enter email and matching passwords")
                 else:
                     try:
-                        uid = create_user(se, sp1)
-                        st.session_state["user_id"] = uid
-                        st.success("Account created"); st.rerun()
+                        uid = create_user(se, sp1); st.session_state["user_id"] = uid; st.success("Account created"); st.rerun()
                     except Exception:
                         st.error("Could not create account (maybe email already used)")
     end_card()
 
-    if not st.session_state.get("user_id"):
-        st.stop()
+    if not st.session_state.get("user_id"): st.stop()
 
     uid = st.session_state["user_id"]
     c2 = section_card("Link your car", "Use Owner Secret (from Admin) to claim your car and manage docs")
     with c2:
         ccid = st.text_input("Car ID", key="claim_car_id")
         csec = st.text_input("Owner Secret", key="claim_secret")
-        if st.button("Claim this car", key="claim_btn"):
-            if claim_car_for_user(ccid or "", csec or "", uid):
-                st.success("Car linked"); st.rerun()
-            else:
-                st.error("Invalid Car ID or Owner Secret")
+        if st.button("Claim this car"):
+            if claim_car_for_user(ccid or "", csec or "", uid): st.success("Car linked"); st.rerun()
+            else: st.error("Invalid Car ID or Owner Secret")
     end_card()
 
     c3 = section_card("My vehicles", "Update password, links, and upload documents")
     with c3:
         mycars = list_user_cars(uid)
-        if not mycars:
-            st.caption("No cars linked yet.")
+        if not mycars: st.caption("No cars linked yet.")
         for car in mycars:
             st.markdown(f"### {car['owner_name']} · {car['car_no']}  {'🟢 Active' if car['is_active'] else '🔴 Inactive'}")
             form_key = f"edit_{car['id']}"
@@ -439,20 +443,16 @@ if page == "user":
                     if blob is not None:
                         upsert_doc(car["id"], kind, blob.name, blob.type or "application/octet-stream", blob.getvalue())
                 st.success("Saved"); st.rerun()
-            if deact:
-                set_active(car["id"], False); st.success("QR deactivated"); st.rerun()
-            if react:
-                set_active(car["id"], True); st.success("QR reactivated"); st.rerun()
+            if deact: set_active(car["id"], False); st.success("QR deactivated"); st.rerun()
+            if react: set_active(car["id"], True); st.success("QR reactivated"); st.rerun()
     end_card()
     st.stop()
 
-# ================== Owner panel (legacy link) ==================
+# ---------------------- Owner panel (legacy link) ----------------------
 if page == "owner":
-    if not owner_id or not secret:
-        st.error("Invalid owner link"); st.stop()
+    if not owner_id or not secret: st.error("Invalid owner link"); st.stop()
     car = get_car(owner_id)
-    if not car or str(car.get("owner_secret")) != str(secret):
-        st.error("Invalid owner link"); st.stop()
+    if not car or str(car.get("owner_secret")) != str(secret): st.error("Invalid owner link"); st.stop()
 
     c = section_card(f"Owner Panel — {'Active' if car['is_active'] else 'Inactive'}",
                      f"{car['owner_name']} · {car['car_no']}", hero=True)
@@ -468,21 +468,17 @@ if page == "owner":
             row = st.columns([1,1])
             save = row[0].form_submit_button("Save changes")
             deact = row[1].form_submit_button("Deactivate QR") if car["is_active"] else None
-        if save:
-            update_owner(owner_id, rc, dl1, dl2, puc, new_pw); st.success("Saved")
-        if deact:
-            set_active(owner_id, False); st.success("QR deactivated"); st.rerun()
+        if save: update_owner(owner_id, rc, dl1, dl2, puc, new_pw); st.success("Saved")
+        if deact: set_active(owner_id, False); st.success("QR deactivated"); st.rerun()
         st.link_button("Open public page", public_url_for_car(owner_id), use_container_width=True)
     end_card()
     st.stop()
 
-# ================== Public ==================
+# ---------------------- Public ----------------------
 if page == "public":
-    if not car_id:
-        st.error("Missing car id"); st.stop()
+    if not car_id: st.error("Missing car id"); st.stop()
     car = get_car(car_id)
-    if not car:
-        st.error("Not found"); st.stop()
+    if not car: st.error("Not found"); st.stop()
     if not car["is_active"]:
         c = section_card("QR inactive", "This QR has been deactivated by the owner or admin.", hero=True)
         end_card(); st.stop()
@@ -493,33 +489,29 @@ if page == "public":
         st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
         st.subheader("View documents (password)")
         pw = st.text_input("Password", type="password", key=f"public_pw_{car_id}", placeholder="Enter password to unlock")
-        if st.button("Unlock", key=f"unlock_{car_id}"):
+        if st.button("Unlock"):
             hash_ = car.get("doc_password_hash")
-            if not hash_:
-                st.error("Owner has not set a password yet.")
-            elif bcrypt.checkpw((pw or "").strip().encode(), hash_.encode()):
+            if not hash_: st.error("Owner has not set a password yet.")
+            elif check_password_hash(hash_, (pw or "").strip()):
                 left, right = st.columns(2)
                 with left:
-                    if car.get("rc_url"):  st.link_button("Open RC link", car["rc_url"], use_container_width=True, key=f"rc_link_{car_id}")
-                    if car.get("dl_url"):  st.link_button("Open DL (front) link", car["dl_url"], use_container_width=True, key=f"dl1_link_{car_id}")
+                    if car.get("rc_url"):  st.link_button("Open RC link", car["rc_url"], use_container_width=True)
+                    if car.get("dl_url"):  st.link_button("Open DL (front) link", car["dl_url"], use_container_width=True)
                 with right:
-                    if car.get("dl_url2"): st.link_button("Open DL (back) link", car["dl_url2"], use_container_width=True, key=f"dl2_link_{car_id}")
-                    if car.get("puc_url"): st.link_button("Open PUC link", car["puc_url"], use_container_width=True, key=f"puc_link_{car_id}")
+                    if car.get("dl_url2"): st.link_button("Open DL (back) link", car["dl_url2"], use_container_width=True)
+                    if car.get("puc_url"): st.link_button("Open PUC link", car["puc_url"], use_container_width=True)
                 docs = get_docs_for_car(car_id)
                 if docs:
                     st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
                     st.subheader("Downloads (uploaded)")
-                    dcols = st.columns(2)
-                    order = [("rc","RC"),("dl1","DL (front)"),("dl2","DL (back)"),("puc","PUC")]
-                    i = 0
+                    dcols = st.columns(2); order = [("rc","RC"),("dl1","DL (front)"),("dl2","DL (back)"),("puc","PUC")]; i=0
                     for k,label in order:
                         if k in docs and docs[k].get("content"):
-                            data = bytes(docs[k]["content"])
-                            name = docs[k].get("filename") or f"{k}.bin"
+                            data = bytes(docs[k]["content"]); name = docs[k].get("filename") or f"{k}.bin"
                             with dcols[i%2]:
                                 st.download_button(f"Download {label}", data, file_name=name,
                                                    mime=docs[k].get("mime") or "application/octet-stream",
-                                                   use_container_width=True, key=f"dl_{k}_{car_id}")
+                                                   use_container_width=True)
                             i += 1
             else:
                 st.error("Wrong password")
@@ -527,7 +519,7 @@ if page == "public":
     end_card()
     st.stop()
 
-# ================== Home ==================
+# ---------------------- Home ----------------------
 c = section_card("MYSCAN", "User dashboard for owners, Admin for creation, Public via QR.", hero=True)
 with c:
     st.markdown("""
