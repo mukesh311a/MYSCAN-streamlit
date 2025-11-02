@@ -73,6 +73,8 @@ def ensure_schema():
           owner_secret UUID NOT NULL,
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
           owner_user_id UUID,
+          activated_at TIMESTAMPTZ,
+          expires_at   TIMESTAMPTZ,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );"""))
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS dl_url2 TEXT;"))
@@ -80,6 +82,8 @@ def ensure_schema():
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS owner_secret UUID;"))
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;"))
         conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS owner_user_id UUID;"))
+        conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ;"))
+        conn.execute(text("ALTER TABLE cars ADD COLUMN IF NOT EXISTS expires_at   TIMESTAMPTZ;"))
         conn.execute(text("UPDATE cars SET is_active=TRUE WHERE is_active IS NULL;"))
 
         conn.execute(text("""
@@ -102,6 +106,17 @@ def ensure_schema():
         );"""))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS docs_car_kind_idx ON docs(car_id, kind);"))
 ensure_schema()
+
+# Auto-expire any cars beyond expires_at
+def enforce_expiry():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE cars
+            SET is_active = FALSE
+            WHERE is_active = TRUE
+              AND expires_at IS NOT NULL
+              AND now() > expires_at
+        """))
 
 # ==================== Utils ====================
 PHONE_RE = re.compile(r"(\+?\d{7,15})")
@@ -145,21 +160,26 @@ def create_car(owner_name, car_no, owner_phone, virtual_number, rc, dl1, dl2, pu
         pw_hash = _hash_pw(doc_pw) if (doc_pw or "").strip() else None
         conn.execute(text("""
           INSERT INTO cars (id, owner_name, car_no, owner_phone, virtual_number,
-                            rc_url, dl_url, dl_url2, puc_url, doc_password_hash, owner_secret, is_active)
+                            rc_url, dl_url, dl_url2, puc_url,
+                            doc_password_hash, owner_secret, is_active)
           VALUES (:id,:on,:cn,:op,:vn,:rc,:dl1,:dl2,:puc,:hash,:sec,TRUE)
         """), dict(id=car_id, on=owner_name, cn=car_no, op=owner_phone, vn=virtual_number,
                    rc=rc, dl1=dl1, dl2=dl2, puc=puc, hash=pw_hash, sec=owner_secret))
         return car_id, owner_secret
 
 def get_car(car_id: str):
+    enforce_expiry()
     with engine.begin() as conn:
         row = conn.execute(text("SELECT * FROM cars WHERE id=:id"), dict(id=car_id)).mappings().first()
         return dict(row) if row else None
 
 def list_cars():
+    enforce_expiry()
     with engine.begin() as conn:
         rows = conn.execute(text("""
-        SELECT id, owner_name, car_no, created_at, is_active FROM cars ORDER BY created_at DESC
+        SELECT id, owner_name, car_no, created_at, is_active, owner_secret, activated_at, expires_at
+        FROM cars
+        ORDER BY created_at DESC
         """)).mappings().all()
         return [dict(r) for r in rows]
 
@@ -175,6 +195,18 @@ def update_owner(car_id, rc, dl1, dl2, puc, new_pw):
         params["hash"] = _hash_pw(new_pw.strip())
     with engine.begin() as conn:
         conn.execute(text(f"UPDATE cars SET {', '.join(sets)} WHERE id=:id"), params)
+
+def activate_with_payment(car_id: str, days: int):
+    days = max(1, int(days))
+    with engine.begin() as conn:
+        # Activate now for N days; preserve IDs
+        conn.execute(text("""
+            UPDATE cars
+            SET is_active   = TRUE,
+                activated_at = now(),
+                expires_at   = now() + (:d || ' days')::interval
+            WHERE id = :id
+        """), dict(id=car_id, d=days))
 
 # ==================== Data access: users & ownership ====================
 def create_user(email: str, password: str):
@@ -193,14 +225,17 @@ def auth_user(email: str, password: str):
         return row["id"] if _check_pw(row["password_hash"], password.strip()) else None
 
 def claim_car_for_user(car_id: str, owner_secret: str, user_id: str) -> bool:
+    # Block claiming if the QR is not active (IDs considered "deactivated")
     with engine.begin() as conn:
-        car = conn.execute(text("SELECT id, owner_secret FROM cars WHERE id=:id"), dict(id=car_id)).mappings().first()
-        if not car or str(car["owner_secret"]) != str(owner_secret):
+        row = conn.execute(text("SELECT id, owner_secret, is_active FROM cars WHERE id=:id"),
+                           dict(id=car_id)).mappings().first()
+        if (not row) or (str(row["owner_secret"]) != str(owner_secret)) or (not row["is_active"]):
             return False
         conn.execute(text("UPDATE cars SET owner_user_id=:u WHERE id=:id"), dict(u=user_id, id=car_id))
         return True
 
 def list_user_cars(user_id: str):
+    enforce_expiry()
     with engine.begin() as conn:
         rows = conn.execute(text("SELECT * FROM cars WHERE owner_user_id=:u ORDER BY created_at DESC"),
                             dict(u=user_id)).mappings().all()
@@ -286,6 +321,7 @@ secret  = get_qp("secret")
 
 # ==================== Admin ====================
 if page == "admin":
+    enforce_expiry()
     c = section_card("Admin dashboard", "Create & manage vehicle QRs", hero=True)
     with c:
         cols = st.columns([2,1])
@@ -304,7 +340,8 @@ if page == "admin":
     if not st.session_state.get("admin_ok"):
         st.stop()
 
-    c2 = section_card("Generate new QR", "Fill in the details below")
+    # --- Create new car / QR ---
+    c2 = section_card("Generate new QR", "Fill in details; we also show Car ID & Owner Secret separately")
     with c2:
         if not PUBLIC_BASE:
             st.info("Tip: set PUBLIC_BASE_URL in Secrets so QR codes use your live domain.")
@@ -336,7 +373,17 @@ if page == "admin":
                     new_id, owner_secret = create_car(on, cn, op_s, vn_s, rc, dl1, dl2, puc, docpw or "")
                     pub_url = public_url_for_car(new_id)
                     own_url = owner_url_for_car(new_id, owner_secret)
+
                     st.success("QRs ready")
+                    # Show identifiers in a neat row so admin can copy/share for signup
+                    idc1, idc2 = st.columns(2)
+                    with idc1:
+                        st.markdown("**Car ID**")
+                        st.code(new_id, language="text")
+                    with idc2:
+                        st.markdown("**Owner Secret**")
+                        st.code(owner_secret, language="text")
+
                     pcols = st.columns([1,1])
                     with pcols[0]:
                         st.markdown("**Public page**"); st.code(pub_url, language="text")
@@ -348,30 +395,53 @@ if page == "admin":
                         st.download_button("Download Owner QR", make_qr_png(own_url), file_name=f"owner-qr-{new_id}.png", mime="image/png")
     end_card()
 
-    c3 = section_card("Vehicles", "Manage status, open public page, regenerate QRs")
+    # --- Manage cars / payment & activation window ---
+    c3 = section_card("Vehicles", "Deactivate, reactivate on payment, set activation window, and view IDs")
     with c3:
         rows = list_cars()
         if not rows:
             st.caption("No entries yet.")
         for r in rows:
             pub_link = public_url_for_car(r['id'])
-            a,b,c,d,e = st.columns([3,1.2,1.6,1.8,1.2])
+            a,b,c,d,e,f = st.columns([2.6,1.1,1.3,2.0,2.2,1.2])
             with a:
                 st.markdown(f"**{r['owner_name']}** · {r['car_no']}")
                 st.caption(str(r['created_at']))
+                # Identifiers block
+                st.caption("Car ID")
+                st.code(r['id'], language="text")
+                st.caption("Owner Secret")
+                st.code(str(r['owner_secret']), language="text")
             with b:
-                st.markdown(f"<span class='chip'>{'Active' if r['is_active'] else 'Inactive'}</span>", unsafe_allow_html=True)
+                active_badge = "Active" if r['is_active'] else "Inactive"
+                st.markdown(f"<span class='chip'>{active_badge}</span>", unsafe_allow_html=True)
             with c:
-                st.link_button("Open public", pub_link)
+                # Expiry info
+                exp = r.get("expires_at")
+                act = r.get("activated_at")
+                if exp:
+                    st.caption("Expires at")
+                    st.code(str(exp), language="text")
+                if act:
+                    st.caption("Activated at")
+                    st.code(str(act), language="text")
             with d:
-                if r['is_active']:
-                    if st.button("Deactivate", key=f"btn_deact_{r['id']}"):
-                        set_active(r['id'], False); st.rerun()
-                else:
-                    if st.button("Reactivate", key=f"btn_react_{r['id']}"):
-                        set_active(r['id'], True); st.rerun()
+                st.link_button("Open public", pub_link)
+                # Payment & activation window
+                st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
+                days = st.number_input("Activate for days", min_value=1, max_value=3650, value=30, step=1, key=f"paydays_{r['id']}")
+                if st.button("Mark payment & Activate", key=f"payact_{r['id']}"):
+                    activate_with_payment(r['id'], int(days))
+                    st.success(f"Activated for {int(days)} day(s)."); st.rerun()
             with e:
-                if st.button("Regenerate", key=f"btn_regen_{r['id']}"):
+                if r['is_active']:
+                    if st.button("Deactivate now", key=f"btn_deact_{r['id']}"):
+                        set_active(r['id'], False); st.success("Deactivated"); st.rerun()
+                else:
+                    # Only Admin can reactivate, and it requires payment → handled above button
+                    st.caption("To reactivate, mark payment & set days.")
+            with f:
+                if st.button("Regenerate QRs", key=f"btn_regen_{r['id']}"):
                     car = get_car(r['id']); own_link = owner_url_for_car(r['id'], car['owner_secret'])
                     st.success("Download fresh QR images below.")
                     g1, g2 = st.columns(2)
@@ -385,6 +455,7 @@ if page == "admin":
 
 # ==================== User dashboard ====================
 if page == "user":
+    enforce_expiry()
     c = section_card("User dashboard", "Sign in to manage your vehicle documents", hero=True)
     with c:
         tab_login, tab_signup = st.tabs(["Sign in", "Create account"])
@@ -412,13 +483,15 @@ if page == "user":
     if not st.session_state.get("user_id"): st.stop()
 
     uid = st.session_state["user_id"]
-    c2 = section_card("Link your car", "Use Owner Secret (from Admin) to claim your car and manage docs")
+    c2 = section_card("Link your car", "Use Car ID and Owner Secret (from Admin) to claim your car")
     with c2:
         ccid = st.text_input("Car ID", key="claim_car_id")
         csec = st.text_input("Owner Secret", key="claim_secret")
         if st.button("Claim this car"):
-            if claim_car_for_user(ccid or "", csec or "", uid): st.success("Car linked"); st.rerun()
-            else: st.error("Invalid Car ID or Owner Secret")
+            if claim_car_for_user(ccid or "", csec or "", uid):
+                st.success("Car linked"); st.rerun()
+            else:
+                st.error("Invalid / inactive Car ID or Owner Secret. Contact Admin.")
     end_card()
 
     c3 = section_card("My vehicles", "Update password, links, and upload documents")
@@ -426,7 +499,9 @@ if page == "user":
         mycars = list_user_cars(uid)
         if not mycars: st.caption("No cars linked yet.")
         for car in mycars:
-            st.markdown(f"### {car['owner_name']} · {car['car_no']}  {'🟢 Active' if car['is_active'] else '🔴 Inactive'}")
+            status = "🟢 Active" if car['is_active'] else "🔴 Inactive"
+            expiry = f" · Expires: {car['expires_at']}" if car.get("expires_at") else ""
+            st.markdown(f"### {car['owner_name']} · {car['car_no']}  {status}{expiry}")
             form_key = f"edit_{car['id']}"
             with st.form(form_key):
                 new_pw = st.text_input("Docs password (leave blank to keep)", type="password", key=f"{form_key}_pw")
@@ -444,12 +519,13 @@ if page == "user":
 
                 cols = st.columns([1,1,1])
                 save = cols[0].form_submit_button("Save changes", use_container_width=True)
+                # Owner cannot reactivate by themselves; payment/reactivation is admin-side
                 if car["is_active"]:
                     deact = cols[1].form_submit_button("Deactivate QR", use_container_width=True)
                     react = None
                 else:
-                    react = cols[1].form_submit_button("Reactivate QR", use_container_width=True)
                     deact = None
+                    react = None
 
             if save:
                 update_owner(car["id"], rc, dl1, dl2, puc, new_pw)
@@ -457,13 +533,14 @@ if page == "user":
                     if blob is not None:
                         upsert_doc(car["id"], kind, blob.name, blob.type or "application/octet-stream", blob.getvalue())
                 st.success("Saved"); st.rerun()
-            if deact: set_active(car["id"], False); st.success("QR deactivated"); st.rerun()
-            if react: set_active(car["id"], True); st.success("QR reactivated"); st.rerun()
+            if deact:
+                set_active(car["id"], False); st.success("QR deactivated"); st.rerun()
     end_card()
     st.stop()
 
 # ==================== Owner panel (legacy link) ====================
 if page == "owner":
+    enforce_expiry()
     if not owner_id or not secret: st.error("Invalid owner link"); st.stop()
     car = get_car(owner_id)
     if not car or str(car.get("owner_secret")) != str(secret): st.error("Invalid owner link"); st.stop()
@@ -490,16 +567,20 @@ if page == "owner":
 
 # ==================== Public ====================
 if page == "public":
+    enforce_expiry()
     if not car_id: st.error("Missing car id"); st.stop()
     car = get_car(car_id)
     if not car: st.error("Not found"); st.stop()
     if not car["is_active"]:
-        c = section_card("QR inactive", "This QR has been deactivated by the owner or admin.", hero=True)
+        msg = "This QR has been deactivated by Admin." if car.get("expires_at") and (time.time()) else "This QR is inactive."
+        c = section_card("QR inactive", msg, hero=True)
         end_card(); st.stop()
 
     c = section_card("Vehicle contact", f"{car['owner_name']} · {car['car_no']}", hero=True)
     with c:
         st.link_button("Contact owner", tel_href(car["virtual_number"]), use_container_width=True)
+        if car.get("expires_at"):
+            st.caption(f"Active until: {car['expires_at']}")
         st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
         st.subheader("View documents (password)")
         pw = st.text_input("Password", type="password", key=f"public_pw_{car_id}", placeholder="Enter password to unlock")
