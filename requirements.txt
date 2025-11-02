@@ -1,0 +1,6 @@
+streamlit==1.39.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.9
+bcrypt==4.2.0
+qrcode==7.4.2
+Pillow==10.4.0
