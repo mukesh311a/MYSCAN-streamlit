@@ -1,12 +1,30 @@
-import os, io, uuid, time, re
+import os, io, uuid, time, re, base64, secrets, hmac, hashlib
 import streamlit as st
 from urllib.parse import urlencode
 from sqlalchemy import create_engine, text
 import qrcode
-from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image
 
-# ---------------------- Settings & DB URL helper ----------------------
+# ==================== Simple PBKDF2 password hashing ====================
+def _hash_pw(pw: str, iterations: int = 200_000) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.strip().encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+def _check_pw(stored: str, pw: str) -> bool:
+    try:
+        algo, iters_s, salt_b64, hash_b64 = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        iters = int(iters_s)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        dk = hashlib.pbkdf2_hmac("sha256", pw.strip().encode(), salt, iters)
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False
+
+# ==================== Settings & DB URL helper ====================
 def get_setting(key, default=None):
     return st.secrets.get(key, os.getenv(key, default))
 
@@ -30,7 +48,7 @@ if not DB_URL:
     st.error("DATABASE_URL is not set. Add it in Streamlit → App settings → Secrets.")
     st.stop()
 
-# ---------------------- DB ----------------------
+# ==================== DB ====================
 try:
     engine = create_engine(DB_URL, pool_pre_ping=True)
 except Exception as e:
@@ -85,7 +103,7 @@ def ensure_schema():
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS docs_car_kind_idx ON docs(car_id, kind);"))
 ensure_schema()
 
-# ---------------------- Utils ----------------------
+# ==================== Utils ====================
 PHONE_RE = re.compile(r"(\+?\d{7,15})")
 def sanitize_phone(s: str) -> str:
     if not s: return ""
@@ -109,24 +127,22 @@ def owner_url_for_car(car_id: str, secret: str) -> str:
     base = PUBLIC_BASE or ""
     return f"{base}?"+ urlencode({"page": "owner", "owner": car_id, "secret": secret}) if base else f"?page=owner&owner={car_id}&secret={secret}"
 
-# Query params helper that works across Streamlit versions
+# Query params helper compatible across Streamlit versions
 def get_qp(name: str, default: str | None = None):
     try:
-        # New API (1.30+)
-        v = st.query_params.get(name)
+        v = st.query_params.get(name)  # 1.30+
         return v if isinstance(v, str) else (v[0] if isinstance(v, list) and v else default)
     except Exception:
-        # Old experimental API
         qp = st.experimental_get_query_params()
         v = qp.get(name)
         return v[0] if isinstance(v, list) and v else default
 
-# ---------------------- Data access: cars ----------------------
+# ==================== Data access: cars ====================
 def create_car(owner_name, car_no, owner_phone, virtual_number, rc, dl1, dl2, puc, doc_pw):
     with engine.begin() as conn:
         car_id = str(uuid.uuid4())
         owner_secret = str(uuid.uuid4())
-        pw_hash = generate_password_hash(doc_pw.strip()) if (doc_pw or "").strip() else None
+        pw_hash = _hash_pw(doc_pw) if (doc_pw or "").strip() else None
         conn.execute(text("""
           INSERT INTO cars (id, owner_name, car_no, owner_phone, virtual_number,
                             rc_url, dl_url, dl_url2, puc_url, doc_password_hash, owner_secret, is_active)
@@ -156,15 +172,15 @@ def update_owner(car_id, rc, dl1, dl2, puc, new_pw):
     params = dict(id=car_id, rc=(rc or None), dl1=(dl1 or None), dl2=(dl2 or None), puc=(puc or None))
     if (new_pw or "").strip():
         sets.append("doc_password_hash=:hash")
-        params["hash"] = generate_password_hash(new_pw.strip())
+        params["hash"] = _hash_pw(new_pw.strip())
     with engine.begin() as conn:
         conn.execute(text(f"UPDATE cars SET {', '.join(sets)} WHERE id=:id"), params)
 
-# ---------------------- Data access: users & ownership ----------------------
+# ==================== Data access: users & ownership ====================
 def create_user(email: str, password: str):
     with engine.begin() as conn:
         uid = str(uuid.uuid4())
-        ph = generate_password_hash(password.strip())
+        ph = _hash_pw(password.strip())
         conn.execute(text("INSERT INTO users (id, email, password_hash) VALUES (:id,:e,:p)"),
                      dict(id=uid, e=email.strip().lower(), p=ph))
         return uid
@@ -174,7 +190,7 @@ def auth_user(email: str, password: str):
         row = conn.execute(text("SELECT id, password_hash FROM users WHERE email=:e"),
                            dict(e=email.strip().lower())).mappings().first()
         if not row: return None
-        return row["id"] if check_password_hash(row["password_hash"], password.strip()) else None
+        return row["id"] if _check_pw(row["password_hash"], password.strip()) else None
 
 def claim_car_for_user(car_id: str, owner_secret: str, user_id: str) -> bool:
     with engine.begin() as conn:
@@ -190,11 +206,14 @@ def list_user_cars(user_id: str):
                             dict(u=user_id)).mappings().all()
         return [dict(r) for r in rows]
 
-# ---------------------- Uploads ----------------------
+# ==================== Uploads (optional binary docs) ====================
 def get_docs_for_car(car_id: str):
     with engine.begin() as conn:
         rows = conn.execute(text("SELECT * FROM docs WHERE car_id=:c"), dict(c=car_id)).mappings().all()
-        out = {};  [out.setdefault(r["kind"], dict(r)) for r in rows];  return out
+        out = {}
+        for r in rows:
+            out[r["kind"]] = dict(r)
+        return out
 
 def upsert_doc(car_id: str, kind: str, filename: str, mime: str, data: bytes):
     with engine.begin() as conn:
@@ -207,28 +226,24 @@ def upsert_doc(car_id: str, kind: str, filename: str, mime: str, data: bytes):
         """), dict(id=doc_id, c=car_id, k=kind, f=filename, m=mime, d=data))
         return doc_id
 
-# ---------------------- THEME (white/blue + light orange) ----------------------
+# ==================== THEME (white/blue + light orange) ====================
 st.set_page_config(page_title="MYSCAN", page_icon="🚗", layout="centered")
 st.markdown("""
 <style>
 :root { --blue:#0b1b3a; --muted:#4a6786; --border:#e6eef6; --orange1:#ffe6cc; --orange2:#ffcc99; --orangeBorder:#ffd7b3; }
-
 [data-testid="stAppViewContainer"] { background:#fff; }
 .topbar{position:sticky;top:0;z-index:1000;background:rgba(255,255,255,.95);backdrop-filter:blur(8px);
   border-bottom:1px solid var(--border);margin-bottom:18px;padding:10px 14px;border-radius:0 0 16px 16px;}
 .topbar .brand{font-weight:800;letter-spacing:.2px;font-size:18px;color:var(--blue)}
 .topbar .muted{color:var(--muted);font-weight:600}
 .topbar a{color:#1d4ed8;text-decoration:none;margin-left:14px}
-
 .card{background:#fff;border:1px solid var(--border);border-radius:16px;padding:22px;box-shadow:0 12px 30px rgba(12,35,64,.06);color:var(--blue)}
 .hero{background:linear-gradient(180deg,#fff,#f8fbff)}
 .h1{font-size:28px;margin:0 0 8px;color:var(--blue)}
 .subtle{color:var(--muted);margin:0}
 .sep{border:0;border-top:1px solid var(--border);margin:18px 0}
 .chip{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid var(--border);color:var(--muted);font-size:12px;background:#f3f8ff}
-
 .stTextInput>div>div>input,.stTextArea textarea{background:#fff;color:var(--blue);border:1px solid var(--border);border-radius:10px}
-
 .stButton>button,.stLinkButton>button{
   display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;min-width:138px;
   border-radius:12px;padding:12px 18px;font-weight:700;border:1px solid var(--orangeBorder);color:#5b2400;
@@ -237,13 +252,12 @@ st.markdown("""
 .btn-secondary button{background:linear-gradient(180deg,#e6f0ff,#cfe0ff);color:var(--blue);border:1px solid #c7d7f7;box-shadow:0 8px 20px rgba(29,78,216,.12)}
 .btn-ghost button{background:#fff;color:var(--muted);border:1px solid var(--border);box-shadow:none}
 .btn-warn  button{background:linear-gradient(180deg,#ffe5e5,#ffd0b3);color:#5b2400;border:1px solid #ffc2a3}
-
 .qr-preview{border:1px dashed #dbe7f3;border-radius:12px;padding:10px;background:#fbfdff}
 .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 </style>
 """, unsafe_allow_html=True)
 
-# Topbar
+# ==================== Topbar ====================
 st.markdown("""
 <div class="topbar">
   <span class="brand">MYSCAN</span>
@@ -264,13 +278,13 @@ def section_card(title: str, subtitle: str = "", hero=False):
 def end_card():
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------------- Router ----------------------
+# ==================== Router ====================
 page   = get_qp("page", "")
 car_id = get_qp("c")
 owner_id = get_qp("owner")
 secret  = get_qp("secret")
 
-# ---------------------- Admin ----------------------
+# ==================== Admin ====================
 if page == "admin":
     c = section_card("Admin dashboard", "Create & manage vehicle QRs", hero=True)
     with c:
@@ -369,7 +383,7 @@ if page == "admin":
     end_card()
     st.stop()
 
-# ---------------------- User dashboard ----------------------
+# ==================== User dashboard ====================
 if page == "user":
     c = section_card("User dashboard", "Sign in to manage your vehicle documents", hero=True)
     with c:
@@ -448,7 +462,7 @@ if page == "user":
     end_card()
     st.stop()
 
-# ---------------------- Owner panel (legacy link) ----------------------
+# ==================== Owner panel (legacy link) ====================
 if page == "owner":
     if not owner_id or not secret: st.error("Invalid owner link"); st.stop()
     car = get_car(owner_id)
@@ -474,7 +488,7 @@ if page == "owner":
     end_card()
     st.stop()
 
-# ---------------------- Public ----------------------
+# ==================== Public ====================
 if page == "public":
     if not car_id: st.error("Missing car id"); st.stop()
     car = get_car(car_id)
@@ -492,7 +506,7 @@ if page == "public":
         if st.button("Unlock"):
             hash_ = car.get("doc_password_hash")
             if not hash_: st.error("Owner has not set a password yet.")
-            elif check_password_hash(hash_, (pw or "").strip()):
+            elif _check_pw(hash_, (pw or "").strip()):
                 left, right = st.columns(2)
                 with left:
                     if car.get("rc_url"):  st.link_button("Open RC link", car["rc_url"], use_container_width=True)
@@ -504,11 +518,14 @@ if page == "public":
                 if docs:
                     st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
                     st.subheader("Downloads (uploaded)")
-                    dcols = st.columns(2); order = [("rc","RC"),("dl1","DL (front)"),("dl2","DL (back)"),("puc","PUC")]; i=0
+                    dcols = st.columns(2)
+                    order = [("rc","RC"),("dl1","DL (front)"),("dl2","DL (back)"),("puc","PUC")]
+                    i = 0
                     for k,label in order:
                         if k in docs and docs[k].get("content"):
-                            data = bytes(docs[k]["content"]); name = docs[k].get("filename") or f"{k}.bin"
-                            with dcols[i%2]:
+                            data = bytes(docs[k]["content"])
+                            name = docs[k].get("filename") or f"{k}.bin"
+                            with dcols[i % 2]:
                                 st.download_button(f"Download {label}", data, file_name=name,
                                                    mime=docs[k].get("mime") or "application/octet-stream",
                                                    use_container_width=True)
@@ -519,7 +536,7 @@ if page == "public":
     end_card()
     st.stop()
 
-# ---------------------- Home ----------------------
+# ==================== Home ====================
 c = section_card("MYSCAN", "User dashboard for owners, Admin for creation, Public via QR.", hero=True)
 with c:
     st.markdown("""
