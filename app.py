@@ -23,6 +23,7 @@ def fix_db_url(url: str) -> str:
 
 
 
+
 DB_URL = fix_db_url(get_setting("DATABASE_URL"))
 ADMIN_PASSWORD = (get_setting("ADMIN_PASSWORD", "change-me") or "").strip()
 PUBLIC_BASE = (get_setting("PUBLIC_BASE_URL") or "").rstrip("/")
