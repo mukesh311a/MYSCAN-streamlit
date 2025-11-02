@@ -13,7 +13,6 @@ def get_setting(key, default=None):
 def fix_db_url(url: str) -> str:
     if not url:
         return url
-    # Normalize postgres://... to postgresql+psycopg://... for SQLAlchemy + psycopg3
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     if url.startswith("postgresql+psycopg://"):
@@ -21,6 +20,7 @@ def fix_db_url(url: str) -> str:
     if url.startswith("postgresql://"):
         return "postgresql+psycopg://" + url[len("postgresql://"):]
     return url
+
 
 
 DB_URL = fix_db_url(get_setting("DATABASE_URL"))
