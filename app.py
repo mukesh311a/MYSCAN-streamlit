@@ -11,7 +11,17 @@ def get_setting(key, default=None):
     return st.secrets.get(key, os.getenv(key, default))
 
 def fix_db_url(url: str) -> str:
-    return url.replace("postgres://", "postgresql+psycopg2://", 1) if url and url.startswith("postgres://") else url
+    if not url:
+        return url
+    # Normalize postgres://... to postgresql+psycopg://... for SQLAlchemy + psycopg3
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql+psycopg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+
 
 DB_URL = fix_db_url(get_setting("DATABASE_URL"))
 ADMIN_PASSWORD = (get_setting("ADMIN_PASSWORD", "change-me") or "").strip()
